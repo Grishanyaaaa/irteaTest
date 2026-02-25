@@ -1,0 +1,154 @@
+package app
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"time"
+
+	"github.com/Grishanyaaaa/irteaTest/internal/config"
+	v1 "github.com/Grishanyaaaa/irteaTest/internal/controllers/http/v1/user"
+	policyuser "github.com/Grishanyaaaa/irteaTest/internal/domain/policy/user"
+	"github.com/Grishanyaaaa/irteaTest/internal/domain/user/dao"
+	"github.com/Grishanyaaaa/irteaTest/internal/domain/user/service"
+	"github.com/Grishanyaaaa/irteaTest/pkg/common/core/closer"
+	"github.com/Grishanyaaaa/irteaTest/pkg/common/logging"
+	"github.com/Grishanyaaaa/irteaTest/pkg/errors"
+	"github.com/Grishanyaaaa/irteaTest/pkg/graceful"
+	"github.com/Grishanyaaaa/irteaTest/pkg/metric"
+	psql "github.com/Grishanyaaaa/irteaTest/pkg/postgresql"
+	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
+)
+
+type App struct {
+	cfg         *config.Config
+	pgClient    *pgxpool.Pool
+	router      *gin.Engine
+	httpServer  *http.Server
+	UserService v1.UserService
+}
+
+func NewApp(ctx context.Context, cfg *config.Config) (App, error) {
+	logging.L(ctx).Info("router initializing")
+
+	router := gin.Default()
+
+	logging.WithFields(ctx,
+		logging.StringField("username", cfg.Postgres.User),
+		logging.StringField("password", "<REMOVED>"),
+		logging.StringField("host", cfg.Postgres.Host),
+		logging.StringField("port", cfg.Postgres.Port),
+		logging.StringField("database", cfg.Postgres.Database),
+	).Info("PostgreSQL initializing")
+
+	pgDsn := fmt.Sprintf(
+		"postgres://%s:%s@%s:%s/%s",
+		cfg.Postgres.User,
+		cfg.Postgres.Password,
+		cfg.Postgres.Host,
+		cfg.Postgres.Port,
+		cfg.Postgres.Database,
+	)
+
+	pgClient, err := psql.NewClient(ctx, 5, 3*time.Second, pgDsn, false)
+	if err != nil {
+		return App{}, errors.Wrap(err, "psql.NewClient")
+	}
+
+	closer.AddN(pgClient)
+
+	logging.L(ctx).Info("handlers initializing")
+
+	logging.L(ctx).Info("heartbeat metric initializing")
+
+	metricHandler := metric.Handler{}
+	metricHandler.Register(router)
+
+	//User service
+	userStorage := dao.NewUserStorage(pgClient)
+	userService := service.NewUserService(userStorage)
+	productPolicy := policyuser.NewUserPolicy(userService)
+	userController := v1.NewUser(productPolicy)
+	//)
+
+	userGroup := router.Group("/user")
+	{
+		userGroup.POST("/create", userController.CreateUser)
+		userGroup.GET("/get/:name", userController.GetUser)
+		userGroup.PATCH("/update", userController.UpdateUser)
+		userGroup.DELETE("/delete/:name", userController.DeleteUser)
+		userGroup.POST("/create-order", userController.CreateOrder)
+		userGroup.POST("/add-to-order", userController.AddToOrder)
+	}
+
+	//Product service
+	productStorage := dao.NewProductStorage(pgClient)
+	productService := service.NewProductService(productStorage)
+	productPolicy := policy_product.NewProductPolicy(productService)
+	productController := v1.New(productPolicy)
+
+	productGroup := router.Group("/product")
+	{
+		productGroup.POST("/create", productController.CreateProduct)
+		productGroup.GET("/get/:name", productController.GetProduct)
+		productGroup.PATCH("/update", productController.UpdateProduct)
+		productGroup.DELETE("/delete/:name", productController.DeleteProduct)
+	}
+
+	return App{
+		cfg:    cfg,
+		router: router,
+	}, nil
+
+}
+
+func (a *App) Run(ctx context.Context) error {
+	grp, ctx := errgroup.WithContext(ctx)
+	grp.Go(func() error {
+		return a.startHTTP(ctx)
+	})
+	return grp.Wait()
+}
+
+func (a *App) startHTTP(ctx context.Context) error {
+	logger := logging.WithFields(ctx,
+		logging.StringField("IP", a.cfg.Server.HOST),
+		logging.StringField("Port", a.cfg.Server.PORT),
+		logging.DurationField("WriteTimeout", a.cfg.Server.WriteTimeout),
+		logging.DurationField("ReadTimeout", a.cfg.Server.ReadTimeout),
+		logging.IntField("MaxHeaderBytes", a.cfg.Server.MaxHeaderBytes),
+	)
+	logger.Info("HTTP Server initializing")
+
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%s", a.cfg.Server.HOST, a.cfg.Server.PORT))
+	if err != nil {
+		logger.With(logging.ErrorField(err)).Fatal("failed to create listener")
+	}
+
+	handler := a.router
+
+	a.httpServer = &http.Server{
+		Handler:        handler,
+		WriteTimeout:   a.cfg.Server.WriteTimeout,
+		ReadTimeout:    a.cfg.Server.ReadTimeout,
+		MaxHeaderBytes: a.cfg.Server.MaxHeaderBytes,
+	}
+	if err = a.httpServer.Serve(listener); err != nil {
+		switch {
+		case errors.Is(err, http.ErrServerClosed):
+			logger.Warn("server shutdown")
+		default:
+			logger.With(logging.ErrorField(err)).Fatal("failed to start server")
+		}
+	}
+
+	httpErrChan := make(chan error, 1)
+	httpShutdownChan := make(chan struct{})
+
+	graceful.PerformGracefulShutdown(a.httpServer, httpErrChan, httpShutdownChan)
+
+	return err
+}
